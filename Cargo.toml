@@ -1,0 +1,14 @@
+[package]
+name = "fherma-solution"
+version = "0.1.0"
+edition = "2021"
+
+# arkworks for the field; sha2 for the rule the constants are derived by,
+# which runs once in init and is not measured.
+[dependencies]
+ark-bn254 = "0.6"
+ark-ff = "0.6"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
