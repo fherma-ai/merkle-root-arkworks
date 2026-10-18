@@ -21,7 +21,6 @@ to answer early.
 ## The shapes
 
 - `leaves` — tensor<N x L x u64>
-- `q` — tensor<L x u64>
 - returns `root` — tensor<L x u64>
 
 ## Generated, and not yours

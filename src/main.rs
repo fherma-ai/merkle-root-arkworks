@@ -1,24 +1,21 @@
 // GENERATED for merkle_root/bn254@1.0.0. Do not edit — `--update` rewrites it.
 //
-//     ./fherma-solution <point directory>
+// The loop the harness drives. Three commands, and they divide the work:
 //
-// Reads the directory a bundle prepared, answers every case in it, and writes
-// what each one cost.
+//     load <case>   read and decode     this file. Not measured.
+//     run           call run()          your code. Measured.
+//     save <out>    encode and write    this file. Not measured.
 //
-//     manifest.json     the point, and how many cases      read
-//     cases/000000/     one file per argument              read
-//     out/000000/       one file per result                written
-//     out/results.json  what each case cost                written
-//
-// Only the call to run() is timed. Reading and writing are outside the window,
-// which is also why seeing the inputs early is not a way to answer early:
-// nothing of yours runs during the read.
+// Only the call is inside the measured window: no disk, no decoding. And
+// nothing of yours runs during `load`, which is why seeing the inputs early is
+// not a way to answer early.
 mod fherma;
 mod solve;
 
 use fherma::{Inputs, Outputs, Point, Tensor};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::time::Instant;
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
@@ -60,11 +57,26 @@ fn number(text: &str, key: &str) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
+fn shape_of(text: &str, name: &str) -> Option<Vec<i64>> {
+    let at = after(text, name, 0)?;
+    let open = after(text, "shape", at)?;
+    let open = text[open..].find('[')? + open;
+    let close = text[open..].find(']')? + open;
+    Some(
+        text[open + 1..close]
+            .split(',')
+            .filter_map(|part| part.trim().parse().ok())
+            .collect(),
+    )
+}
+
 fn read<T: Wire>(
     dir: &Path,
     name: &str,
-    shape: Vec<i64>,
+    descriptor: &str,
 ) -> Result<Tensor<T>, Box<dyn std::error::Error>> {
+    let shape = shape_of(descriptor, name).ok_or("no shape")?;
+
     let raw = fs::read(dir.join(format!("{name}.bin")))?;
     let width = std::mem::size_of::<T>();
     let count: usize = shape.iter().product::<i64>() as usize;
@@ -76,113 +88,95 @@ fn read<T: Wire>(
     Ok(Tensor { shape, data })
 }
 
-fn write<T: Wire>(dir: &Path, name: &str, tensor: &Tensor<T>) -> Fallible {
-    let mut bytes = Vec::with_capacity(tensor.data.len() * std::mem::size_of::<T>());
+fn write<T: Wire>(
+    dir: &Path,
+    name: &str,
+    tensor: &Tensor<T>,
+    shapes: &mut String,
+) -> Fallible {
+    let mut raw = Vec::with_capacity(tensor.data.len() * std::mem::size_of::<T>());
     for value in &tensor.data {
-        bytes.extend_from_slice(&value.to_wire());
+        raw.extend_from_slice(&value.to_wire());
     }
-    fs::write(dir.join(format!("{name}.bin")), bytes)?;
+    fs::write(dir.join(format!("{name}.bin")), raw)?;
+
+    if !shapes.is_empty() {
+        shapes.push(',');
+    }
+    let dims: Vec<String> = tensor.shape.iter().map(|d| d.to_string()).collect();
+    shapes.push_str(&format!(
+        r#""{name}":{{"shape":[{}],"elem":"{}"}}"#,
+        dims.join(","),
+        elem_of::<T>()
+    ));
     Ok(())
 }
 
-fn numbered(i: usize) -> String {
-    format!("{i:06}")
-}
-
-/// Written after every case, not at the end: a process killed on its timeout
-/// has still done the cases before it, and a file written once at the end
-/// would throw them away. A panic ends the process the same way, which is why
-/// nothing here tries to catch one.
-fn report(out: &Path, init_s: f64, cases: &[String]) -> Fallible {
-    let body = cases.join(",");
-    fs::write(
-        out.join("results.json"),
-        format!("{{\"init_s\":{init_s:.9},\"cases\":[{body}]}}"),
-    )?;
-    Ok(())
-}
-
-fn ok(i: usize, seconds: f64) -> String {
-    format!("{{\"i\":{i},\"seconds\":{seconds:.9},\"status\":\"ok\"}}")
-}
-
-fn crashed(i: usize, why: &str) -> String {
-    let mut clean = String::new();
-    for c in why.chars().take(200) {
-        match c {
-            '"' | '\\' => {
-                clean.push('\\');
-                clean.push(c);
-            }
-            '\n' => clean.push(' '),
-            _ => clean.push(c),
-        }
+fn elem_of<T>() -> &'static str {
+    match std::mem::size_of::<T>() {
+        1 => "i8",
+        2 => "i16",
+        4 => "i32",
+        _ => "i64",
     }
-    format!("{{\"i\":{i},\"seconds\":null,\"status\":\"crashed\",\"note\":\"{clean}\"}}")
 }
 
 fn main() -> Fallible {
-    let root = match std::env::args().nth(1) {
-        Some(one) => PathBuf::from(one),
-        None => {
-            eprintln!("usage: fherma-solution <point directory>");
-            std::process::exit(2);
+    let mut state = None;
+    let mut inp = Inputs::default();
+    let mut answer = Outputs::default();
+
+    for line in io::stdin().lock().lines() {
+        let line = line?;
+        let (verb, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+
+        match verb {
+            "init" => {
+                let text = fs::read_to_string(rest)?;
+                let point_dir = std::path::Path::new(rest).parent().unwrap_or_else(|| std::path::Path::new(".")).join("point");
+                let N: u32 = number(&text, "N").unwrap_or(0.0) as u32;
+                let L: u32 = number(&text, "L").unwrap_or(0.0) as u32;
+                let q = read::<u64>(&point_dir, "q", &format!(r#"{{"q":{{"shape":[{}]}}}}"#, L))?;
+                let point = Point { N, L, q };
+                let started = Instant::now();
+                state = Some(solve::init(&point));
+                println!("ready {:.9}", started.elapsed().as_secs_f64());
+            }
+            "load" => {
+                let dir = Path::new(rest);
+                let shapes = fs::read_to_string(dir.join("case.json"))?;
+                inp.leaves = read(&dir, "leaves", &shapes)?;
+                println!("loaded");
+            }
+            "run" => {
+                let held = state.as_mut().ok_or("init was not called")?;
+                let started = Instant::now();
+                answer = solve::run(held, &inp);
+                println!("done {:.9}", started.elapsed().as_secs_f64());
+            }
+            "save" => {
+                let dir = Path::new(rest);
+                fs::create_dir_all(dir)?;
+                let mut shapes = String::new();
+                write(&dir, "root", &answer.root, &mut shapes)?;
+                // Built by concatenation rather than a format string: the
+                // braces would have to survive three layers of escaping to get
+                // here, and one of them already lost.
+                let body = String::from(r#"{"shapes":{"#) + &shapes + "}}";
+                fs::write(dir.join("case.json"), body)?;
+                println!("saved");
+            }
+            "stop" => {
+                if let Some(held) = state.take() {
+                    solve::free(held);
+                }
+                println!("bye");
+                io::stdout().flush()?;
+                return Ok(());
+            }
+            _ => {}
         }
-    };
-
-    let text = fs::read_to_string(root.join("manifest.json"))?;
-    let N: u32 = number(&text, "N").unwrap_or(0.0) as u32;
-    let L: u32 = number(&text, "L").unwrap_or(0.0) as u32;
-    let point = Point { N, L };
-    let total = number(&text, "cases").unwrap_or(0.0) as usize;
-
-    let answers_root = root.join("out");
-    fs::create_dir_all(&answers_root)?;
-
-    let setup = Instant::now();
-    let mut state = solve::init(&point);
-    let init_s = setup.elapsed().as_secs_f64();
-
-    let mut cases: Vec<String> = Vec::new();
-    report(&answers_root, init_s, &cases)?;
-
-    for i in 0..total {
-        let dir = root.join("cases").join(numbered(i));
-        let answers = answers_root.join(numbered(i));
-
-        let mut inp = Inputs::default();
-        if let Err(why) = (|inp: &mut Inputs| -> Fallible {
-            inp.leaves = read(&dir, "leaves", vec![point.N as i64, point.L as i64])?;
-            inp.q = read(&dir, "q", vec![point.L as i64])?;
-            Ok(())
-        })(&mut inp)
-        {
-            cases.push(crashed(i, &format!("reading the case: {why}")));
-            report(&answers_root, init_s, &cases)?;
-            continue;
-        }
-
-        // Monotonic, and around the call and nothing else.
-        let started = Instant::now();
-        let answer: Outputs = solve::run(&mut state, &inp);
-        let seconds = started.elapsed().as_secs_f64();
-
-        if let Err(why) = (|| -> Fallible {
-            fs::create_dir_all(&answers)?;
-            write(&answers, "root", &answer.root)?;
-            Ok(())
-        })()
-        {
-            cases.push(crashed(i, &format!("writing the answer: {why}")));
-            report(&answers_root, init_s, &cases)?;
-            continue;
-        }
-
-        cases.push(ok(i, seconds));
-        report(&answers_root, init_s, &cases)?;
+        io::stdout().flush()?;
     }
-
-    solve::free(state);
-    report(&answers_root, init_s, &cases)?;
     Ok(())
 }
